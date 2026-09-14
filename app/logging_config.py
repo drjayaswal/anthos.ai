@@ -15,6 +15,85 @@ current_log_queue: contextvars.ContextVar[Optional[asyncio.Queue]] = contextvars
 )
 
 
+def parse_log_entry(raw_msg: str) -> tuple[str, str, str]:
+    """
+    Parses a raw log message into:
+      (stage, tag, concise_message)
+    Where concise_message is meaningful and guaranteed to be <= 5 words.
+    """
+    lower = raw_msg.lower()
+
+    # 1. Cleaning
+    if "cleaning email" in lower:
+        return "clean", "CLEAN", "Cleaning email content"
+    if "failed to clean" in lower:
+        return "error", "ERROR", "Email cleaning failed"
+
+    # 2. Regex
+    if "running regex" in lower:
+        return "regex", "REGEX", "Running regex categorization"
+
+    # 3. Model Initializations
+    if "initialized classification llm" in lower:
+        return "llm", "LLM", "Classification model ready"
+    if "initialized supervisor llm" in lower:
+        return "supervisor", "REVIEW", "Supervisor model ready"
+
+    # 4. Supervisor Review & Decisions
+    if "supervisor approved" in lower:
+        return "supervisor", "APPROVED", "Supervisor approved category"
+    if "supervisor rejected" in lower:
+        return "retry", "RETRY", "Supervisor rejected category"
+    if "max retries without approval" in lower or "max retries" in lower:
+        return "retry", "RETRY", "Max retries reached"
+    if "reclassifying email" in lower or "reclassifying" in lower:
+        return "retry", "RETRY", "Reclassifying rejected email"
+    if "running supervisor review" in lower or "semaphore for supervisor" in lower:
+        return "supervisor", "REVIEW", "Running supervisor review"
+    if "supervisor review failed" in lower:
+        return "error", "ERROR", "Supervisor review failed"
+
+    # 5. LLM Categorization
+    if "categorized as" in lower:
+        match = re.search(r"categorized as ['\"]?([^'\",\n\)]+)['\"]?", raw_msg, re.IGNORECASE)
+        if match:
+            cat_name = match.group(1).strip()
+            words = ("Categorized as " + cat_name).split()
+            if len(words) <= 5:
+                return "llm", "LLM", " ".join(words)
+            return "llm", "LLM", " ".join(words[:5])
+        return "llm", "LLM", "Email categorized by LLM"
+    if "running llm categorization" in lower or "classification llm" in lower or "sending to llm" in lower:
+        return "llm", "LLM", "Running LLM categorization"
+    if "llm categorization failed" in lower:
+        return "error", "ERROR", "LLM categorization failed"
+
+    # 6. Workflow / Completion
+    if "completed" in lower or "finished analysis" in lower or "total analysis time" in lower:
+        return "complete", "DONE", "Analysis completed successfully"
+    if "delivered results" in lower:
+        return "complete", "DONE", "Delivered analysis results"
+    if "confirmed analysis" in lower:
+        return "info", "START", "Analysis request confirmed"
+    if "starting analysis" in lower:
+        return "info", "START", "Starting email analysis"
+    if "websocket /analyse accepted" in lower:
+        return "info", "CONNECT", "Connected to stream"
+
+    # 7. Errors
+    if "error" in lower or "failed" in lower:
+        words = raw_msg.strip().split()
+        if len(words) <= 5:
+            return "error", "ERROR", " ".join(words)
+        return "error", "ERROR", "Analysis execution failed"
+
+    # 8. Fallback
+    words = raw_msg.strip().split()
+    if len(words) <= 5:
+        return "info", "INFO", " ".join(words)
+    return "info", "INFO", " ".join(words[:5])
+
+
 class WebSocketLogHandler(logging.Handler):
     """
     Logging handler that intercepts log records and pushes them into the
@@ -29,12 +108,17 @@ class WebSocketLogHandler(logging.Handler):
         if queue is None:
             return
         try:
+            raw_msg = record.getMessage()
+            if "afc is enabled" in raw_msg.lower() or "automatic function calling" in raw_msg.lower():
+                return
+            stage, tag, clean_msg = parse_log_entry(raw_msg)
             log_item = {
                 "type": "log",
                 "status": "processing",
                 "level": record.levelname,
-                "name": record.name,
-                "message": record.getMessage(),
+                "tag": tag,
+                "stage": stage,
+                "message": clean_msg,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             queue.put_nowait(log_item)

@@ -42,6 +42,51 @@ def normalize_provider(provider: str) -> str:
     return PROVIDER_MAP[provider]
 
 
+def validate_model_config(model_detail: ModelDetail) -> tuple[bool, str, str]:
+    """
+    Pre-validate the user's model configuration before starting analysis.
+    Returns (is_valid, error_code, detail_message).
+    When default=True the system's own credentials are used, so no validation
+    is needed on the user-supplied fields.
+    """
+    if model_detail.default:
+        # Default mode uses the system API key — nothing to validate
+        return True, "", ""
+
+    # ── Provider check ────────────────────────────────────────────────────
+    normalized = model_detail.provider.strip().lower()
+    if normalized not in PROVIDER_MAP:
+        supported = ", ".join(
+            name.title() for name in PROVIDER_MAP.keys()
+        )
+        return (
+            False,
+            "INVALID_PROVIDER",
+            f"Provider '{model_detail.provider}' is not supported. "
+            f"Supported providers: {supported}",
+        )
+
+    # ── API key check ─────────────────────────────────────────────────────
+    if not model_detail.api_key or not model_detail.api_key.strip():
+        return (
+            False,
+            "MISSING_API_KEY",
+            f"An API key is required when using a custom model "
+            f"(provider: {model_detail.provider}, model: {model_detail.name}). "
+            f"Please add your API key in Settings.",
+        )
+
+    # ── Model name check ──────────────────────────────────────────────────
+    if not model_detail.name or not model_detail.name.strip():
+        return (
+            False,
+            "INVALID_MODEL",
+            "Model name cannot be empty. Please select or enter a valid model name.",
+        )
+
+    return True, "", ""
+
+
 
 class Agent:
         

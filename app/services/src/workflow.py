@@ -93,16 +93,26 @@ class EmailWorkflow:
 
         logger.info("Finished analysis: %d succeeded, %d failed", succeeded, failed)
 
-
         logger.info(
             "Total analysis time: %.2f seconds",
             end_time - start_time,
         )
 
-    
-        return processed_results
+        # ── Surface errors to the caller ──────────────────────────────────
+        # Collect all exceptions from the gather results for inspection
+        first_exc = next(
+            (r for r in results if isinstance(r, Exception)), None
+        )
 
-        
-        
-        
-        
+        if succeeded == 0 and first_exc is not None:
+            # Every email failed — almost certainly a model/API key problem.
+            # Re-raise so the WebSocket handler can classify it and send a
+            # proper error frame to the frontend.
+            logger.error(
+                "All %d email(s) failed; propagating exception to caller: %s",
+                failed,
+                first_exc,
+            )
+            raise first_exc
+
+        return processed_results

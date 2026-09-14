@@ -13,6 +13,7 @@ from app.database.db import get_db
 from app.database.models import Category, Model
 from app.logging_config import current_log_queue, setup_logging
 from app.schemas import AnalyseRequest, AnalyseResponse, CategoryDetail, ModelDetail
+from app.services.src.agents import validate_model_config
 from app.services.src.workflow import EmailWorkflow
 from app.settings import get_settings
 
@@ -133,6 +134,84 @@ async def execute_email_analysis(payload: AnalyseRequest, db: Session) -> list[d
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Helper: classify analysis exceptions into user-friendly error codes
+# ─────────────────────────────────────────────────────────────────────────────
+def _classify_analysis_error(exc: Exception) -> tuple[str, str]:
+    """
+    Inspect an exception raised during analysis and return
+    (error_code, human_message) for the WebSocket error frame.
+    Always returns custom, concise, human-friendly error messages.
+    """
+    exc_str = str(exc).lower()
+    exc_type = type(exc).__name__.lower()
+
+    if hasattr(exc, "__cause__") and exc.__cause__:
+        exc_str += " " + str(exc.__cause__).lower()
+    if hasattr(exc, "__context__") and exc.__context__:
+        exc_str += " " + str(exc.__context__).lower()
+
+    # 1. Provider not supported
+    if "unsupported provider" in exc_str:
+        return "INVALID_PROVIDER", "Unsupported AI provider. Please choose a supported provider."
+
+    # 2. API key / authentication errors
+    auth_keywords = [
+        "authentication", "401", "unauthorized", "invalid api key",
+        "invalid x-api-key", "api key", "invalid_api_key",
+        "permission denied", "forbidden", "403",
+        "could not authenticate", "credentials", "incorrect api key",
+    ]
+    if any(kw in exc_str for kw in auth_keywords) or "auth" in exc_type:
+        return "INVALID_API_KEY", "Invalid API key. Please check your API key in Settings."
+
+    # 3. Model not found / not available at the provider
+    model_keywords = [
+        "model not found", "model_not_found", "does not exist",
+        "not found", "404", "no such model", "not available",
+        "decommissioned", "do not have access to it", "do not have access",
+        "invalid model",
+    ]
+    if (
+        any(kw in exc_str for kw in model_keywords) and "email" not in exc_str
+    ) or "notfound" in exc_type:
+        return "LLM_INIT_FAILED", "Model not found or unavailable. Check model name in Settings."
+
+    # 4. Rate limiting / quota
+    rate_keywords = [
+        "rate limit", "429", "quota", "too many requests",
+        "rate_limit", "resource_exhausted", "capacity",
+    ]
+    if any(kw in exc_str for kw in rate_keywords):
+        return "RATE_LIMIT_EXCEEDED", "Rate limit exceeded. Please wait a moment and try again."
+
+    # 5. Token context limits
+    token_keywords = ["context length", "maximum context", "token limit", "too long", "prompt too large"]
+    if any(kw in exc_str for kw in token_keywords):
+        return "TOKEN_LIMIT_EXCEEDED", "Email content exceeds model context limit."
+
+    # 6. LLM API key not set in environment
+    if "not set" in exc_str and ("api_key" in exc_str or "api key" in exc_str):
+        return "MISSING_API_KEY", "API key missing. Please configure your key in Settings."
+
+    # 7. Provider down / unreachable
+    conn_keywords = ["connection refused", "timeout", "timed out", "connect error", "network", "bad gateway", "502", "503", "504"]
+    if any(kw in exc_str for kw in conn_keywords):
+        return "PROVIDER_UNAVAILABLE", "AI provider is unreachable. Please try again later."
+
+    # 8. Generic LLM / provider errors
+    llm_keywords = [
+        "llm", "openai", "anthropic", "google", "bedrock",
+        "groq", "nvidia", "ollama", "deepseek", "perplexity",
+        "openrouter", "chat_model", "init_chat_model",
+    ]
+    if any(kw in exc_str or kw in exc_type for kw in llm_keywords):
+        return "LLM_ERROR", "AI model failed to process the request."
+
+    # 9. Catch-all
+    return "ANALYSIS_FAILED", "Analysis failed due to an unexpected error."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # WebSocket endpoint — ONE request per connection, no looping
 # ─────────────────────────────────────────────────────────────────────────────
 @router.websocket("/analyse")
@@ -180,10 +259,66 @@ async def websocket_analyse(websocket: WebSocket) -> None:
             await safe_send_json(websocket, {
                 "type": "error",
                 "status": "error",
-                "message": "Invalid request payload",
-                "detail": str(err),
+                "error_code": "INVALID_PAYLOAD",
+                "message": "Invalid request payload. Please verify your email selection.",
             })
             return
+
+        # ── Step 3.5: validate model configuration ───────────────────────
+        with get_db_session() as db:
+            # Resolve the model from DB to get API key for non-default models
+            if not payload.model.default:
+                from app.database.models import Model as DbModel
+                db_model = (
+                    db.query(DbModel)
+                    .filter(
+                        (DbModel.id == payload.model.id)
+                        | (DbModel.name == payload.model.name)
+                    )
+                    .first()
+                )
+                if db_model:
+                    # Populate API key from DB into the payload model
+                    payload.model.api_key = db_model.api_key
+                else:
+                    logger.warning(
+                        "Model not found in DB: id=%s, name=%s",
+                        payload.model.id,
+                        payload.model.name,
+                    )
+                    await safe_send_json(websocket, {
+                        "type": "error",
+                        "status": "error",
+                        "error_code": "MODEL_NOT_FOUND",
+                        "message": "Model not found. Please check your model in Settings.",
+                        "field": "model",
+                    })
+                    return
+
+            # Run the pre-flight validation
+            is_valid, error_code, detail_msg = validate_model_config(payload.model)
+            if not is_valid:
+                error_messages = {
+                    "INVALID_PROVIDER": "Unsupported AI provider. Please choose a supported provider.",
+                    "MISSING_API_KEY": "API key is missing. Please add your key in Settings.",
+                    "INVALID_MODEL": "Invalid model name. Please check your model in Settings.",
+                }
+                error_fields = {
+                    "INVALID_PROVIDER": "provider",
+                    "MISSING_API_KEY": "api_key",
+                    "INVALID_MODEL": "name",
+                }
+                logger.warning(
+                    "Model validation failed (%s): %s", error_code, detail_msg
+                )
+                await safe_send_json(websocket, {
+                    "type": "error",
+                    "status": "error",
+                    "error_code": error_code,
+                    "message": error_messages.get(error_code, "Model configuration error."),
+                    "field": error_fields.get(error_code),
+                })
+                return
 
         # ── Step 4: immediate confirmation ───────────────────────────────
         sent = await safe_send_json(websocket, {
@@ -251,13 +386,14 @@ async def websocket_analyse(websocket: WebSocket) -> None:
             await log_queue.put(None)
             if not log_task.done():
                 await log_task
-            # Try to notify the client
+            # Try to notify the client with a specific error code
             if connection_alive:
+                error_code, message = _classify_analysis_error(exc)
                 await safe_send_json(websocket, {
                     "type": "error",
                     "status": "error",
-                    "message": "Failed to analyze emails",
-                    "detail": str(exc),
+                    "error_code": error_code,
+                    "message": message,
                 })
         finally:
             # Always reset the context var to avoid leaking the queue
@@ -303,9 +439,10 @@ async def analyze(
         return AnalyseResponse(results=results)
     except Exception as exc:
         logger.exception("Analysis failed on HTTP POST: %s", exc)
+        error_code, message = _classify_analysis_error(exc)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Analysis failed: {str(exc)}",
+            status_code=status.HTTP_400_BAD_REQUEST if error_code != "ANALYSIS_FAILED" else status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=message,
         )
 
 
