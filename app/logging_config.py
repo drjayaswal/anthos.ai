@@ -2,44 +2,58 @@ import asyncio
 import contextvars
 from datetime import datetime, timezone
 import logging
+import re
 import sys
 from typing import Optional
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Context variable: holds an asyncio.Queue for the active WebSocket request.
-# Each WebSocket request sets its own queue; all logger.info/warning/error
-# calls from any module during that request get captured and forwarded.
-# ─────────────────────────────────────────────────────────────────────────────
 current_log_queue: contextvars.ContextVar[Optional[asyncio.Queue]] = contextvars.ContextVar(
     "current_log_queue", default=None
 )
 
+_NOISE_PATTERNS = [
+    "http request:",
+    "acquired llm semaphore",
+    "websocket /analyse accepted",
+    "websocket /analyze accepted",
+    "confirmed analysis",
+    "delivered results",
+    "client disconnected",
+    "afc is enabled",
+    "automatic function calling",
+    "uvicorn",
+    "httpx",
+    "httpcore",
+]
 
-def parse_log_entry(raw_msg: str) -> tuple[str, str, str]:
+
+def _is_noise(lower: str) -> bool:
+    return any(pattern in lower for pattern in _NOISE_PATTERNS)
+
+
+def parse_log_entry(raw_msg: str) -> tuple[str, str, str] | None:
     """
-    Parses a raw log message into:
-      (stage, tag, concise_message)
-    Where concise_message is meaningful and guaranteed to be <= 5 words.
+    Parses a raw log message into (stage, tag, concise_message).
+    Returns None for internal/noisy messages that should not be forwarded.
+    concise_message is guaranteed to be <= 5 words.
     """
     lower = raw_msg.lower()
 
-    # 1. Cleaning
+    if _is_noise(lower):
+        return None
+
     if "cleaning email" in lower:
         return "clean", "CLEAN", "Cleaning email content"
     if "failed to clean" in lower:
         return "error", "ERROR", "Email cleaning failed"
 
-    # 2. Regex
     if "running regex" in lower:
         return "regex", "REGEX", "Running regex categorization"
 
-    # 3. Model Initializations
     if "initialized classification llm" in lower:
         return "llm", "LLM", "Classification model ready"
     if "initialized supervisor llm" in lower:
         return "supervisor", "REVIEW", "Supervisor model ready"
 
-    # 4. Supervisor Review & Decisions
     if "supervisor approved" in lower:
         return "supervisor", "APPROVED", "Supervisor approved category"
     if "supervisor rejected" in lower:
@@ -53,7 +67,6 @@ def parse_log_entry(raw_msg: str) -> tuple[str, str, str]:
     if "supervisor review failed" in lower:
         return "error", "ERROR", "Supervisor review failed"
 
-    # 5. LLM Categorization
     if "categorized as" in lower:
         match = re.search(r"categorized as ['\"]?([^'\",\n\)]+)['\"]?", raw_msg, re.IGNORECASE)
         if match:
@@ -68,26 +81,21 @@ def parse_log_entry(raw_msg: str) -> tuple[str, str, str]:
     if "llm categorization failed" in lower:
         return "error", "ERROR", "LLM categorization failed"
 
-    # 6. Workflow / Completion
-    if "completed" in lower or "finished analysis" in lower or "total analysis time" in lower:
-        return "complete", "DONE", "Analysis completed successfully"
-    if "delivered results" in lower:
-        return "complete", "DONE", "Delivered analysis results"
-    if "confirmed analysis" in lower:
-        return "info", "START", "Analysis request confirmed"
     if "starting analysis" in lower:
         return "info", "START", "Starting email analysis"
-    if "websocket /analyse accepted" in lower:
-        return "info", "CONNECT", "Connected to stream"
 
-    # 7. Errors
+    if "analysed" in lower:
+        return "info", "INFO", raw_msg.strip()
+
+    if "total time:" in lower or "total time" in lower:
+        return "info", "TIME", raw_msg.strip()
+
     if "error" in lower or "failed" in lower:
         words = raw_msg.strip().split()
         if len(words) <= 5:
             return "error", "ERROR", " ".join(words)
         return "error", "ERROR", "Analysis execution failed"
 
-    # 8. Fallback
     words = raw_msg.strip().split()
     if len(words) <= 5:
         return "info", "INFO", " ".join(words)
@@ -109,9 +117,10 @@ class WebSocketLogHandler(logging.Handler):
             return
         try:
             raw_msg = record.getMessage()
-            if "afc is enabled" in raw_msg.lower() or "automatic function calling" in raw_msg.lower():
+            result = parse_log_entry(raw_msg)
+            if result is None:
                 return
-            stage, tag, clean_msg = parse_log_entry(raw_msg)
+            stage, tag, clean_msg = result
             log_item = {
                 "type": "log",
                 "status": "processing",
@@ -123,7 +132,6 @@ class WebSocketLogHandler(logging.Handler):
             }
             queue.put_nowait(log_item)
         except Exception:
-            # Never let a logging error crash the application
             pass
 
 
@@ -136,18 +144,15 @@ def setup_logging(level: int = logging.INFO) -> None:
     """
     root_logger = logging.getLogger()
 
-    # Ensure root logger captures at least INFO level messages
     if root_logger.level == logging.NOTSET or root_logger.level > level:
         root_logger.setLevel(level)
 
-    # Attach WebSocketLogHandler (only once — idempotent)
     has_ws_handler = any(isinstance(h, WebSocketLogHandler) for h in root_logger.handlers)
     if not has_ws_handler:
         ws_handler = WebSocketLogHandler()
         ws_handler.setLevel(level)
         root_logger.addHandler(ws_handler)
 
-    # Standard console handler — keeps printing to stdout (only once)
     has_stream_handler = any(
         isinstance(h, logging.StreamHandler) and not isinstance(h, WebSocketLogHandler)
         for h in root_logger.handlers

@@ -108,8 +108,7 @@ class Nodes:
 
             async with self.llm_with_semaphore:
                 logger.info(
-                "Acquired LLM semaphore for categorization: %s",
-                email.id)
+                "Acquired LLM semaphore")
 
 
 
@@ -160,8 +159,7 @@ class Nodes:
             async with self.llm_with_semaphore:
 
                 logger.info(
-                "Acquired LLM semaphore for supervisor: %s",
-                email.id)
+                "Acquired LLM semaphore")
 
 
                 response = await agent.supervise_email.ainvoke({

@@ -26,9 +26,13 @@ class EmailWorkflow:
 
         semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_EMAILS)
 
+        completed_counter = 0
+        counter_lock = asyncio.Lock()
+
         async def run_one(email: ProcessedEmail):
+            nonlocal completed_counter
             async with semaphore:
-                return await builder.ainvoke(
+                res = await builder.ainvoke(
                     {
                         "one_email": email,
                         "email_count": email_count,
@@ -39,7 +43,12 @@ class EmailWorkflow:
                         "version_list": [1],
                     }
                 )
- 
+                async with counter_lock:
+                    completed_counter += 1
+                    unit = "email" if completed_counter == 1 else "emails"
+                    logger.info("%d %s analysed", completed_counter, unit)
+                return res
+
         start_time = perf_counter()
         results = await asyncio.gather(
             *[run_one(email) for email in processed_input_emails], return_exceptions=True)
@@ -50,31 +59,14 @@ class EmailWorkflow:
         succeeded = 0
         failed = 0
 
-
         for source_email, result in zip(processed_input_emails, results):
                 if isinstance(result, Exception):
-                    logger.error( "Email %s failed during analysis: %s", source_email.id, result, exc_info=result)
-
-                    failed+=1
-
+                    logger.error("Email %s failed during analysis: %s", source_email.id, result, exc_info=result)
+                    failed += 1
                     continue
 
                 email = result["one_email"]
-                            
-
-                # Log per-email analysis
-                logger.info(
-                    "Email %s completed | "
-                    "category=%s | confidence=%.2f | priority=%.1f | "
-                    "retries=%d",
-                    email.id,
-                    email.category,
-                    email.confidence_score or 0,
-                    email.priority_score or 0,
-                    result["retry_counter"],
-                )
-
-                succeeded+=1
+                succeeded += 1
 
                 processed_results.append({
                     "id": email.id,
@@ -86,17 +78,17 @@ class EmailWorkflow:
                     "versions": result["version_list"],
                     "retry_count": result["retry_counter"],
                     })
-                
-           
-                
-            
 
-        logger.info("Finished analysis: %d succeeded, %d failed", succeeded, failed)
+        total_unit = "email" if succeeded == 1 else "emails"
+        logger.info("%d %s analysed", succeeded, total_unit)
 
-        logger.info(
-            "Total analysis time: %.2f seconds",
-            end_time - start_time,
-        )
+        duration = end_time - start_time
+        if duration < 60:
+            time_str = f"{duration:.2f}s"
+        else:
+            time_str = f"{int(duration // 60)}m {int(duration % 60)}s"
+
+        logger.info("Total time: %s", time_str)
 
         # ── Surface errors to the caller ──────────────────────────────────
         # Collect all exceptions from the gather results for inspection
